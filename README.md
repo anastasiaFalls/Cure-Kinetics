@@ -18,10 +18,6 @@ Plot log(cure rate) vs 1/T for Arrhenius analysis
 
 Estimate activation energy across conversion levels
 
-
-Future additions may include:
-----------------------------------
-
 Kissinger and Ozawa kinetic fits
 
 Kamal–Sourour model comparison
