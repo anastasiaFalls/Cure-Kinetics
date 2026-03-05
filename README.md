@@ -8,18 +8,18 @@ This project processes DSC datasets obtained at different heating rates and extr
 Features:
 -----------------
 
-Import and process DSC datasets
+* Import and process DSC datasets
 
-Compute degree of cure (α) from heat flow data
+* Compute degree of cure (α) from heat flow data
 
-Generate isoconversion datasets across multiple heating rates
+* Generate isoconversion datasets across multiple heating rates
 
-Plot log(cure rate) vs 1/T for Arrhenius analysis
+* Plot log(cure rate) vs 1/T for Arrhenius analysis
 
-Estimate activation energy across conversion levels
+* Estimate activation energy across conversion levels
 
-Kissinger and Ozawa kinetic fits
+* Kissinger and Ozawa kinetic fits
 
-Kamal–Sourour model comparison
+* Kamal–Sourour model comparison
 
-automated error detection and dataset validation
+* Automated error detection and dataset validation
