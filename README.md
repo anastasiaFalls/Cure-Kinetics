@@ -23,3 +23,21 @@ Features:
 * Kamal–Sourour model comparison
 
 * Automated error detection and dataset validation
+
+
+
+Requirements
+------------------
+
+Python 3.9+
+
+Typical libraries used:
+
+numpy
+pandas
+matplotlib
+scipy
+
+Install dependencies with:
+
+pip install -r requirements.txt
