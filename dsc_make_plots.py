@@ -264,14 +264,30 @@ def compute_alpha_and_rate(df, meta, *, clamp_negative_hf=True, enforce_monotoni
 
     hf = df["HF_corr"].to_numpy(dtype=float)
 
-    # Remove negative heat flow (baseline noise)
-    hf = np.maximum(hf, 0.0)
+    # remove negative baseline noise
+    hf = np.maximum(hf, 0)
 
-    # --- remove tail where reaction is finished ---
+    # remove reaction tail
     peak = np.max(hf)
-    threshold = 0.03 * peak   # 3% of peak heat flow
+    threshold = 0.03 * peak
 
     mask = hf >= threshold
+    first = np.argmax(mask)
+    last = len(mask) - np.argmax(mask[::-1])
+
+    df = df.iloc[first:last].reset_index(drop=True)
+    hf = hf[first:last]
+
+    t_s = df["t_min"].to_numpy() * 60
+
+    cum = cumulative_trapz(t_s, hf)
+    alpha = cum / cum[-1]
+
+    # force monotonic α
+    alpha = np.maximum.accumulate(alpha)
+
+    rate = np.gradient(alpha, t_s)
+    rate = np.maximum(rate, 0)
 
     # keep only the main reaction region
     first = np.argmax(mask)
