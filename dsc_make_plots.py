@@ -6,6 +6,9 @@ import matplotlib.pyplot as plt
 
 from scipy.interpolate import PchipInterpolator
 from scipy.signal import savgol_filter
+from scipy.stats import linregress
+from scipy.optimize import least_squares
+
 
 # =========================
 # User settings
@@ -540,6 +543,315 @@ def compute_alpha_and_rate(df: pd.DataFrame, kinetics_tmin: float = 50.0):
 
     return df
 
+def run_kissinger_analysis(runs_kinetics, out_dir: Path, fig_dir: Path, dpi: int = 350):
+    """
+    Perform Kissinger analysis using peak temperatures from each heating rate.
+    Uses the temperature of maximum corrected/smoothed heat flow as T_p.
+    """
+    R = 8.314462618  # J/mol/K
+
+    rows = []
+
+    for df in runs_kinetics:
+        if df.empty:
+            continue
+
+        beta = df["beta_C_min"].iloc[0]
+        fname = df["file"].iloc[0] if "file" in df.columns else "unknown"
+
+        if not np.isfinite(beta) or beta <= 0:
+            continue
+
+        if "HF_corr_smooth_mW" in df.columns:
+            ysig = df["HF_corr_smooth_mW"].to_numpy(dtype=float)
+        else:
+            ysig = np.maximum(df["HF_corr_mW"].to_numpy(dtype=float), 0.0)
+
+        T_C = df["T_C"].to_numpy(dtype=float)
+
+        if len(T_C) < 5:
+            continue
+
+        peak_idx = int(np.argmax(ysig))
+        Tp_C = T_C[peak_idx]
+        Tp_K = Tp_C + 273.15
+
+        if not np.isfinite(Tp_K) or Tp_K <= 0:
+            continue
+
+        x = 1.0 / Tp_K
+        y = np.log(beta / (Tp_K ** 2))
+
+        rows.append(
+            {
+                "file": fname,
+                "beta_C_min": beta,
+                "Tp_C": Tp_C,
+                "Tp_K": Tp_K,
+                "inv_Tp_Kinv": x,
+                "ln_beta_over_Tp2": y,
+            }
+        )
+
+    kiss_df = pd.DataFrame(rows).sort_values("beta_C_min").reset_index(drop=True)
+
+    if len(kiss_df) < 3:
+        raise ValueError("Need at least 3 valid heating rates for Kissinger analysis.")
+
+    fit = linregress(kiss_df["inv_Tp_Kinv"], kiss_df["ln_beta_over_Tp2"])
+
+    slope = fit.slope
+    intercept = fit.intercept
+    r_value = fit.rvalue
+    r2 = r_value ** 2
+
+    Ea_J_mol = -slope * R
+    Ea_kJ_mol = Ea_J_mol / 1000.0
+    A_per_min = (Ea_J_mol / R) * np.exp(intercept)
+
+    kiss_df["fit_y"] = intercept + slope * kiss_df["inv_Tp_Kinv"]
+
+    summary = pd.DataFrame(
+        [
+            {
+                "slope": slope,
+                "intercept": intercept,
+                "r_squared": r2,
+                "Ea_J_per_mol": Ea_J_mol,
+                "Ea_kJ_per_mol": Ea_kJ_mol,
+                "A_per_min": A_per_min,
+            }
+        ]
+    )
+
+    kiss_df.to_csv(out_dir / "kissinger_points.csv", index=False)
+    summary.to_csv(out_dir / "kissinger_summary.csv", index=False)
+
+    # Plot
+    plt.figure()
+    plt.scatter(kiss_df["inv_Tp_Kinv"], kiss_df["ln_beta_over_Tp2"], label="Runs")
+
+    xfit = np.linspace(
+        kiss_df["inv_Tp_Kinv"].min(),
+        kiss_df["inv_Tp_Kinv"].max(),
+        200,
+    )
+    yfit = intercept + slope * xfit
+    plt.plot(xfit, yfit, label="Linear fit")
+
+    for _, row in kiss_df.iterrows():
+        plt.annotate(
+            f"{row['beta_C_min']:g} °C/min",
+            (row["inv_Tp_Kinv"], row["ln_beta_over_Tp2"]),
+            textcoords="offset points",
+            xytext=(5, 5),
+            fontsize=8,
+        )
+
+    plt.xlabel(r"$1/T_p$ (1/K)")
+    plt.ylabel(r"$\ln(\beta/T_p^2)$")
+    plt.title("Kissinger Plot")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(fig_dir / "05_kissinger_plot.png", dpi=dpi)
+    plt.show()
+
+    return kiss_df, summary
+
+def kamal_sourour_rate(alpha, T_K, A1, A2, E, m, n):
+    """
+    Reduced Kamal-Sourour model with single activation energy.
+
+    dα/dt = (A1 + A2 α^m) * exp(-E/(R*T)) * (1-α)^n
+    """
+
+    R = 8.314462618
+
+    alpha = np.asarray(alpha, dtype=float)
+    T_K = np.asarray(T_K, dtype=float)
+
+    k = np.exp(-E / (R * T_K))
+
+    return (A1 + A2 * alpha**m) * k * (1 - alpha)**n
+
+
+def build_ks_fit_dataset(big_kin: pd.DataFrame, alpha_min: float = 0.03, alpha_max: float = 0.97):
+    """
+    Build a global dataset for Kamal-Sourour fitting from all runs.
+    """
+    df = big_kin.copy()
+
+    df = df[np.isfinite(df["alpha"]) & np.isfinite(df["rate"]) & np.isfinite(df["T_C"])].copy()
+    df = df[(df["alpha"] >= alpha_min) & (df["alpha"] <= alpha_max)].copy()
+    df = df[df["rate"] > 0].copy()
+
+    if len(df) < 30:
+        raise ValueError("Too few data points left for Kamal-Sourour fitting.")
+
+    df["T_K"] = df["T_C"] + 273.15
+    return df.reset_index(drop=True)
+
+def ks_residuals_logA(params, alpha, T_K, rate_obs):
+    """
+    Residuals for Kamal-Sourour fitting in log-rate space.
+
+    params:
+        log10(A1), log10(A2), E, m, n
+    """
+
+    log10_A1, log10_A2, E, m, n = params
+
+    A1 = 10 ** log10_A1
+    A2 = 10 ** log10_A2
+
+    rate_pred = kamal_sourour_rate(alpha, T_K, A1, A2, E, m, n)
+
+    eps = 1e-12
+
+    return np.log(rate_pred + eps) - np.log(rate_obs + eps)
+
+
+def run_kamal_sourour_fit(big_kin: pd.DataFrame, out_dir: Path, fig_dir: Path, dpi: int = 350):
+    """
+    Fit the standard nonisothermal Kamal-Sourour model to all runs together,
+    using log-rate residuals for a more balanced fit across heating rates.
+    """
+    fit_df = build_ks_fit_dataset(big_kin, alpha_min=0.05, alpha_max=0.90)
+
+    alpha = fit_df["alpha"].to_numpy(dtype=float)
+    T_K = fit_df["T_K"].to_numpy(dtype=float)
+    rate_obs = fit_df["rate"].to_numpy(dtype=float)
+
+    # Initial guesses
+    # [log10(A1), E1, log10(A2), E2, m, n]
+    x0 = np.array([
+        6.0,       # A1 ~ 1e6 1/s
+        85000.0,   # E
+        9.0,       # A2 ~ 1e9 1/s
+        1.0,       # m
+        2.0,       # n
+    ])
+
+    # Tighter, more physical bounds
+    lower = np.array([
+        0.0,       # log10(A1)
+        20000.0,   # E1
+        0.0,       # log10(A2)
+        0.2,       # m
+        0.5,       # n
+    ])
+
+    upper = np.array([
+        20.0,       # log10(A1)
+        150000.0,   # E
+        20.0,       # log10(A2)
+        3.0,        # m
+        3.5,        # n
+    ])
+
+    print("\nKS fit settings:")
+    print(f"alpha range: {fit_df['alpha'].min():.4f} to {fit_df['alpha'].max():.4f}")
+    print("x0    =", x0)
+    print("lower =", lower)
+    print("upper =", upper)
+
+    result = least_squares(
+        ks_residuals_logA,
+        x0=x0,
+        bounds=(lower, upper),
+        args=(alpha, T_K, rate_obs),
+        max_nfev=50000,
+    )
+
+    if not result.success:
+        raise ValueError(f"Kamal-Sourour fit failed: {result.message}")
+
+    print("result.x =", result.x)
+
+    log10_A1, E1, log10_A2, E2, m, n = result.x
+    A1 = 10.0 ** log10_A1
+    A2 = 10.0 ** log10_A2
+
+    rate_pred = kamal_sourour_rate(alpha, T_K, A1, E1, A2, E2, m, n)
+
+    # Standard R^2 in linear rate space for interpretability
+    ss_res = np.sum((rate_obs - rate_pred) ** 2)
+    ss_tot = np.sum((rate_obs - np.mean(rate_obs)) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    # Also compute log-space R^2 since that's what we're fitting
+    eps = 1e-12
+    log_obs = np.log(rate_obs + eps)
+    log_pred = np.log(rate_pred + eps)
+    ss_res_log = np.sum((log_obs - log_pred) ** 2)
+    ss_tot_log = np.sum((log_obs - np.mean(log_obs)) ** 2)
+    r2_log = 1.0 - ss_res_log / ss_tot_log if ss_tot_log > 0 else np.nan
+
+    param_df = pd.DataFrame(
+        [
+            {
+                "A1_1_per_s": A1,
+                "E1_J_per_mol": E1,
+                "E1_kJ_per_mol": E1 / 1000.0,
+                "A2_1_per_s": A2,
+                "E2_J_per_mol": E2,
+                "E2_kJ_per_mol": E2 / 1000.0,
+                "m": m,
+                "n": n,
+                "r_squared_linear": r2,
+                "r_squared_log": r2_log,
+                "n_points": len(fit_df),
+                "cost": result.cost,
+                "success": result.success,
+                "message": result.message,
+            }
+        ]
+    )
+
+    out_points = fit_df.copy()
+    out_points["rate_pred"] = rate_pred
+    out_points["residual_linear"] = rate_pred - rate_obs
+    out_points["residual_log"] = np.log(rate_pred + eps) - np.log(rate_obs + eps)
+
+    param_df.to_csv(out_dir / "kamal_sourour_summary.csv", index=False)
+    out_points.to_csv(out_dir / "kamal_sourour_fit_points.csv", index=False)
+
+    # Plot 1: observed vs predicted
+    plt.figure()
+    plt.scatter(rate_obs, rate_pred, s=12)
+    lo = min(rate_obs.min(), rate_pred.min())
+    hi = max(rate_obs.max(), rate_pred.max())
+    plt.plot([lo, hi], [lo, hi])
+    plt.xlabel("Observed dα/dt (1/s)")
+    plt.ylabel("Predicted dα/dt (1/s)")
+    plt.title("Kamal-Sourour Fit: Observed vs Predicted")
+    plt.tight_layout()
+    plt.savefig(fig_dir / "06_kamal_sourour_observed_vs_predicted.png", dpi=dpi)
+    plt.show()
+
+    # Plot 2: rate vs alpha by heating rate
+    plt.figure()
+    for beta, g in out_points.groupby("beta_C_min"):
+        label_obs = f"{beta:g} °C/min obs" if np.isfinite(beta) else "unknown β obs"
+        label_fit = f"{beta:g} °C/min fit" if np.isfinite(beta) else "unknown β fit"
+
+        g = g.sort_values("alpha").copy()
+
+        g_obs = g.groupby(np.round(g["alpha"], 4), as_index=False)["rate"].mean()
+        g_fit = g.groupby(np.round(g["alpha"], 4), as_index=False)["rate_pred"].mean()
+
+        plt.plot(g_obs["alpha"], g_obs["rate"], label=label_obs)
+        plt.plot(g_fit["alpha"], g_fit["rate_pred"], linestyle="--", label=label_fit)
+
+    plt.xlabel("Degree of Cure α")
+    plt.ylabel("Curing Rate dα/dt (1/s)")
+    plt.title("Kamal-Sourour Fit vs Experimental Data")
+    plt.legend(fontsize=7, ncol=2)
+    plt.tight_layout()
+    plt.savefig(fig_dir / "07_kamal_sourour_rate_vs_alpha_fit.png", dpi=dpi)
+    plt.show()
+
+    return param_df, out_points
 
 # =========================
 # Main
@@ -767,7 +1079,7 @@ def main():
         plt.savefig(FIG_DIR / "03_degree_of_cure_vs_temperature.png", dpi=DPI)
         plt.show()
 
-        # ---- Plot 4: rate vs alpha ----
+         # ---- Plot 4: rate vs alpha ----
         plt.figure()
         for beta, g in big_kin.groupby("beta_C_min"):
             label = f"{beta:g} °C/min" if np.isfinite(beta) else "unknown β"
@@ -786,12 +1098,42 @@ def main():
         plt.savefig(FIG_DIR / "04_rate_vs_degree_of_cure.png", dpi=DPI)
         plt.show()
 
+        try:
+            kiss_df, kiss_summary = run_kissinger_analysis(
+                runs_kinetics,
+                out_dir=OUT_DIR,
+                fig_dir=FIG_DIR,
+                dpi=DPI,
+            )
+            print("\nKissinger analysis complete:")
+            print(kiss_summary.to_string(index=False))
+        except Exception as e:
+            print(f"\nKissinger analysis skipped: {e}")
+
+            print("\n---- Running Kamal-Sourour fit ----")
+
+        try:
+            ks_summary, ks_points = run_kamal_sourour_fit(
+                big_kin,
+                out_dir=OUT_DIR,
+                fig_dir=FIG_DIR,
+                dpi=DPI,
+            )
+
+            print("\nKamal-Sourour fitted parameters:")
+            print(ks_summary.to_string(index=False))
+
+        except Exception as e:
+            print(f"\nKamal-Sourour fit failed: {e}")  
+
     print(f"\nSaved figures to: {FIG_DIR.resolve()}")
     print(f"Saved processed CSVs to: {OUT_DIR.resolve()}")
     print("Saved per-run full corrected files as *_full_corrected.csv")
     print("Saved per-run kinetics files as *_kinetics.csv")
     print("Saved baseline debug plots as debug_baseline_*.png")
 
+    print("\nDone.")
+    
 
 if __name__ == "__main__":
     main()
