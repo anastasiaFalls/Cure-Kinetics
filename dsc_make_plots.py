@@ -3,6 +3,7 @@ import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.interpolate import UnivariateSpline
 
 
 # =========================
@@ -14,14 +15,21 @@ FIG_DIR = Path("figures")            # will be created
 OUT_DIR = Path("processed")          # will be created
 
 # Baseline windows (°C): adjust after you see Plot 1 if needed
-BASELINE_LEFT  = (70, 95)            # before reaction
+BASELINE_LEFT  = (0, 40)            # before reaction
 BASELINE_RIGHT = (220, 245)          # after reaction
 
 # Optional: limit processing range
-T_MIN, T_MAX = 25, 250
+T_MIN, T_MAX = -50, 250
 
 # Save figure DPI (slide-friendly)
 DPI = 350
+
+# Peak region to exclude from spline baseline fitting
+PEAK_EXCLUDE_LEFT = 80
+PEAK_EXCLUDE_RIGHT = 190
+
+# Spline smoothing factor
+SPLINE_SMOOTHING = 5
 
 
 # =========================
@@ -211,23 +219,54 @@ def read_ta_dsc_txt(path: Path):
 # DSC processing
 # =========================
 
-def linear_baseline(T, Y, left_window, right_window):
-    l0, l1 = left_window
-    r0, r1 = right_window
-    left_mask = (T >= l0) & (T <= l1)
-    right_mask = (T >= r0) & (T <= r1)
+def spline_baseline_subtract(df, peak_left, peak_right, smoothing=5):
+    """
+    Fit a spline baseline through the non-peak regions of the DSC curve,
+    then subtract it to isolate the reaction peak.
 
-    if left_mask.sum() < 3 or right_mask.sum() < 3:
+    Parameters
+    ----------
+    df : DataFrame
+        Must contain columns 'T_C' and 'HF_mW'
+    peak_left, peak_right : float
+        Temperature bounds of the reaction peak region to exclude
+    smoothing : float
+        Spline smoothing factor; larger = smoother baseline
+
+    Returns
+    -------
+    df_out : DataFrame
+        Original dataframe with added columns:
+        - baseline
+        - HF_corr
+    """
+    df_out = df.copy().sort_values("T_C").reset_index(drop=True)
+
+    T = df_out["T_C"].to_numpy()
+    HF = df_out["HF_mW"].to_numpy()
+
+    # Keep only non-peak regions for baseline fitting
+    baseline_mask = (T < peak_left) | (T > peak_right)
+
+    T_base = T[baseline_mask]
+    HF_base = HF[baseline_mask]
+
+    if len(T_base) < 10:
         raise ValueError(
-            f"Baseline windows not found / too small. "
-            f"Left count={left_mask.sum()}, Right count={right_mask.sum()}"
+            "Not enough baseline points outside the excluded peak region. "
+            "Adjust PEAK_EXCLUDE_LEFT / PEAK_EXCLUDE_RIGHT."
         )
 
-    T1, y1 = T[left_mask].mean(), Y[left_mask].mean()
-    T2, y2 = T[right_mask].mean(), Y[right_mask].mean()
-    m = (y2 - y1) / (T2 - T1)
-    b = y1 - m * T1
-    return m * T + b
+    # Fit spline through non-peak baseline points
+    spline = UnivariateSpline(T_base, HF_base, s=smoothing)
+
+    baseline = spline(T)
+    HF_corr = HF - baseline
+
+    df_out["baseline"] = baseline
+    df_out["HF_corr"] = HF_corr
+
+    return df_out
 
 
 def cumulative_trapz(x, y):
@@ -236,97 +275,74 @@ def cumulative_trapz(x, y):
     return np.concatenate([[0.0], np.cumsum(dx * avg)])
 
 
-def compute_alpha_and_rate(df, meta, *, clamp_negative_hf=True, enforce_monotonic_alpha=True):
+def compute_alpha_and_rate(df, meta):
     """
-    Fixes the 'loopty loop' by computing alpha in TIME-space (not temperature-space),
-    and then computing rate = dα/dt. This prevents α backtracking.
-
-    Parameters
-    ----------
-    clamp_negative_hf : bool
-        If True, sets negative baseline-corrected heat flow to 0 before integrating.
-        This prevents unphysical "uncuring" from baseline/noise.
-    enforce_monotonic_alpha : bool
-        If True, forces α to be nondecreasing via cumulative max (removes tiny numerical backtracks).
+    Compute alpha and curing rate in TIME-space.
+    Includes:
+    - negative HF clipping
+    - reaction-region trimming
+    - monotonic alpha enforcement
+    - smoothing
+    - endpoint cleanup
     """
-
-    # --- require time ---
     if "t_min" not in df.columns or df["t_min"].isna().any():
-        raise ValueError("Need a valid 't_min' column to compute α(t) and dα/dt reliably.")
+        raise ValueError("Need valid time data in 't_min'.")
 
-    # Work in time order (critical)
     df = df.sort_values("t_min").reset_index(drop=True)
 
     t_s = df["t_min"].to_numpy(dtype=float) * 60.0
-
-    if "HF_corr" not in df.columns:
-        raise ValueError("Expected 'HF_corr' column (baseline-subtracted heat flow).")
-
     hf = df["HF_corr"].to_numpy(dtype=float)
 
-    # remove negative baseline noise
-    hf = np.maximum(hf, 0)
+    # 1) Remove negative baseline noise
+    hf = np.maximum(hf, 0.0)
 
-    # remove reaction tail
+    # 2) Trim to reaction region only
     peak = np.max(hf)
-    threshold = 0.03 * peak
+    if peak <= 0:
+        raise ValueError("HF_corr never becomes positive; baseline likely wrong.")
 
+    threshold = 0.03 * peak   # 3% of peak
     mask = hf >= threshold
+
+    if np.sum(mask) < 10:
+        raise ValueError("Reaction region too small after thresholding.")
+
     first = np.argmax(mask)
     last = len(mask) - np.argmax(mask[::-1])
 
     df = df.iloc[first:last].reset_index(drop=True)
-    hf = hf[first:last]
+    t_s = df["t_min"].to_numpy(dtype=float) * 60.0
+    hf = np.maximum(df["HF_corr"].to_numpy(dtype=float), 0.0)
 
-    t_s = df["t_min"].to_numpy() * 60
+    # 3) Smooth heat flow slightly
+    window = min(21, len(hf) if len(hf) % 2 == 1 else len(hf) - 1)
+    if window >= 5:
+        kernel = np.ones(window) / window
+        hf = np.convolve(hf, kernel, mode="same")
 
+    # 4) Integrate in time
     cum = cumulative_trapz(t_s, hf)
-    alpha = cum / cum[-1]
-
-    # force monotonic α
-    alpha = np.maximum.accumulate(alpha)
-
-    rate = np.gradient(alpha, t_s)
-    rate = np.maximum(rate, 0)
-
-    # keep only the main reaction region
-    first = np.argmax(mask)
-    last = len(mask) - np.argmax(mask[::-1])
-
-    df = df.iloc[first:last].reset_index(drop=True)
-    hf = hf[first:last]
-
-    # Optional: remove unphysical negative segments caused by imperfect baseline
-    if clamp_negative_hf:
-        hf_use = np.maximum(hf, 0.0)
-    else:
-        hf_use = hf
-
-    # Cumulative integral in time: alpha(t) = ∫0^t HF dt / ∫0^T HF dt
-    cum = cumulative_trapz(t_s, hf_use)
     total = cum[-1]
 
-    if not np.isfinite(total) or abs(total) < 1e-12:
-        raise ValueError(
-            "Total corrected heat flow integral is ~0. "
-            "Baseline windows likely wrong or HF_corr got wiped out."
-        )
+    if total <= 0:
+        raise ValueError("Total integrated heat is zero after trimming.")
 
     alpha = cum / total
 
-    # Optional: enforce monotonic alpha (kills tiny numerical backtracks)
-    if enforce_monotonic_alpha:
-        alpha = np.maximum.accumulate(alpha)
+    # 5) Force monotonic alpha
+    alpha = np.maximum.accumulate(alpha)
 
-    df["alpha"] = alpha
-
-    # Rate dα/dt (1/s)
+    # 6) Compute rate
     rate = np.gradient(alpha, t_s)
 
-    # Optional safety: set tiny negative rates to 0 (baseline noise)
-    if clamp_negative_hf:
-        rate = np.maximum(rate, 0.0)
+    # remove tiny negative numerical noise
+    rate = np.maximum(rate, 0.0)
 
+    # 7) Clean endpoints so curves go to zero nicely
+    rate[0] = 0.0
+    rate[-1] = 0.0
+
+    df["alpha"] = alpha
     df["rate"] = rate
 
     return df
@@ -371,12 +387,31 @@ def main():
         # Using time-sorted data, then sort by T for baseline math stability
         df_T = df.sort_values("T_C").reset_index(drop=True)
 
-        T = df_T["T_C"].to_numpy()
-        HF = df_T["HF_mW"].to_numpy()
+        df_T = spline_baseline_subtract(
+            df_T,
+            peak_left=PEAK_EXCLUDE_LEFT,
+            peak_right=PEAK_EXCLUDE_RIGHT,
+            smoothing=SPLINE_SMOOTHING
+        )
 
-        base = linear_baseline(T, HF, BASELINE_LEFT, BASELINE_RIGHT)
-        df_T["baseline"] = base
-        df_T["HF_corr"] = HF - base
+# --- DEBUG: visualize spline baseline ---
+    plt.figure()
+    plt.plot(df_T["T_C"], df_T["HF_mW"], label="Raw HF")
+    plt.plot(df_T["T_C"], df_T["baseline"], label="Spline baseline")
+
+    plt.axvspan(
+        PEAK_EXCLUDE_LEFT,
+        PEAK_EXCLUDE_RIGHT,
+        alpha=0.2,
+        label="Excluded peak region"
+    )
+
+    plt.xlabel("Temperature (°C)")
+    plt.ylabel("Heat Flow (mW)")
+    plt.title(f"Spline baseline check: {f.name}")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
         # Put the corrected HF back onto time-sorted df as well (needed for rate by time)
         # We interpolate HF_corr(T) onto the time-ordered temperature trace.
@@ -443,13 +478,23 @@ def main():
     plt.show()
 
     # ---- Plot 4 ----
+    # ---- Plot 4 ----
     plt.figure()
     for beta, g in big.groupby("beta_C_min"):
         label = f"{beta:g} °C/min" if np.isfinite(beta) else "unknown β"
-        plt.plot(g["alpha"], g["rate"], label=label)
+
+    # sort by alpha before plotting
+        g2 = g.sort_values("alpha").copy()
+
+    # optional: collapse duplicate alpha values by averaging
+        g2 = g2.groupby(np.round(g2["alpha"], 4), as_index=False)["rate"].mean()
+        g2.columns = ["alpha", "rate"]
+
+        plt.plot(g2["alpha"], g2["rate"], label=label)
+
     plt.xlabel("Degree of cure α")
     plt.ylabel("Curing rate dα/dt (1/s)")
-    plt.title("Curing rate vs Degree of cure")
+    plt.title("Curing Rate vs Degree of Cure")
     plt.legend()
     plt.tight_layout()
     plt.savefig(FIG_DIR / "04_rate_vs_degree_of_cure.png", dpi=DPI)
