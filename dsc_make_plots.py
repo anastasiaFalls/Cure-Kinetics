@@ -105,14 +105,88 @@ def remove_marker_rows(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def keep_heating_ramp(df: pd.DataFrame, allow_small_cooling: float = -0.5) -> pd.DataFrame:
+def keep_main_heating_ramp(
+    df: pd.DataFrame,
+    beta_target_C_min: float | None,
+    tol_frac: float = 0.35,
+    smooth_window: int = 9,
+    min_run_points: int = 30,
+) -> pd.DataFrame:
     """
-    Relaxed filter: allows small temperature reversals/noise without deleting real data.
+    Keep only the main sustained heating ramp.
+
+    Uses the local measured heating rate dT/dt and retains the longest
+    contiguous region whose ramp rate is close to the programmed value.
+    Falls back to a simple monotonic-heating filter if beta is unavailable.
     """
     out = df.sort_values("t_min").reset_index(drop=True).copy()
-    dT = out["T_C"].diff()
-    keep = dT.isna() | (dT > allow_small_cooling)
-    return out[keep].reset_index(drop=True)
+
+    if len(out) < 10:
+        return out
+
+    t = out["t_min"].to_numpy(dtype=float)
+    T = out["T_C"].to_numpy(dtype=float)
+
+    dt = np.diff(t)
+    dT = np.diff(T)
+
+    valid = dt > 0
+    rate = np.full(len(out), np.nan)
+    rate_mid = np.full(len(dt), np.nan)
+    rate_mid[valid] = dT[valid] / dt[valid]   # °C/min because t is already in minutes
+
+    # Put mid-point rates back onto point grid
+    if len(rate_mid) > 0:
+        rate[1:] = rate_mid
+        rate[0] = rate[1]
+
+    # Smooth the local ramp rate a little
+    rate_series = pd.Series(rate)
+    rate_smooth = (
+        rate_series.rolling(window=smooth_window, center=True, min_periods=1).median()
+        .to_numpy()
+    )
+
+    if beta_target_C_min is None or not np.isfinite(beta_target_C_min) or beta_target_C_min <= 0:
+        # Fallback: keep strictly rising portion only
+        keep = np.r_[True, dT > 0]
+        return out[keep].reset_index(drop=True)
+
+    low = (1.0 - tol_frac) * beta_target_C_min
+    high = (1.0 + tol_frac) * beta_target_C_min
+
+    good = np.isfinite(rate_smooth) & (rate_smooth >= low) & (rate_smooth <= high)
+
+    # Find longest contiguous "good ramp" segment
+    best_start = None
+    best_end = None
+    start = None
+
+    for i, flag in enumerate(good):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            end = i
+            if best_start is None or (end - start) > (best_end - best_start):
+                best_start, best_end = start, end
+            start = None
+
+    if start is not None:
+        end = len(good)
+        if best_start is None or (end - start) > (best_end - best_start):
+            best_start, best_end = start, end
+
+    if best_start is None or (best_end - best_start) < min_run_points:
+        # Fallback if detection fails
+        keep = np.r_[True, dT > -0.1]
+        return out[keep].reset_index(drop=True)
+
+    out = out.iloc[best_start:best_end].reset_index(drop=True)
+
+    # Remove any exact duplicate temperatures that create vertical spikes in T-space
+    out = out.loc[out["T_C"].diff().fillna(1) != 0].reset_index(drop=True)
+
+    return out
 
 
 def sanity_clip_hf_spikes(df: pd.DataFrame, z_thresh: float = 8.0) -> pd.DataFrame:
@@ -500,8 +574,28 @@ def main():
             df, meta = read_ta_dsc_txt(f)
 
             df = remove_marker_rows(df)
-            df = keep_heating_ramp(df, allow_small_cooling=-0.5)
+            df = keep_main_heating_ramp(
+                df,
+                beta_target_C_min=meta.get("heating_rate_C_min"),
+                tol_frac=0.35,
+                smooth_window=9,
+                min_run_points=30,
+            )
             df = sanity_clip_hf_spikes(df, z_thresh=8.0)
+
+            print(
+                f"  Main ramp kept: {df['T_C'].min():.2f} to {df['T_C'].max():.2f} °C "
+                f"with {len(df)} points"
+            )
+
+            print(f"  Temp range after cleaning: {df['T_C'].min():.2f} to {df['T_C'].max():.2f} °C")
+            print(f"  Points after cleaning: {len(df)}")
+
+            df = df[(df["T_C"] >= T_MIN) & (df["T_C"] <= T_MAX)].reset_index(drop=True)
+            if len(df) < 30:
+                raise ValueError("Too few points after temperature filtering.")
+
+            df_T = df.sort_values("T_C").reset_index(drop=True).copy()
 
             print(f"  Temp range after cleaning: {df['T_C'].min():.2f} to {df['T_C'].max():.2f} °C")
             print(f"  Points after cleaning: {len(df)}")
@@ -636,6 +730,7 @@ def main():
     # ---- Plot 1: Raw heat flow vs temperature ----
     plt.figure()
     for name, g in big_plot.groupby("file"):
+        g = g[g["T_C"] >= 0]
         plt.plot(g["T_C"], g["HF_W_per_g"], label=name)
     plt.xlabel("Temperature (°C)")
     plt.ylabel("Heat Flow (W/g)")
@@ -648,6 +743,7 @@ def main():
     # ---- Plot 2: Corrected bell curves ----
     plt.figure()
     for name, g in big_plot.groupby("file"):
+        g = g[g["T_C"] >= 0]
         plt.plot(g["T_C"], g["HFcorr_W_per_g"], label=name)
     plt.xlabel("Temperature (°C)")
     plt.ylabel("Corrected Heat Flow (W/g)")
@@ -699,4 +795,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
