@@ -236,33 +236,66 @@ def cumulative_trapz(x, y):
     return np.concatenate([[0.0], np.cumsum(dx * avg)])
 
 
-def compute_alpha_and_rate(df, meta):
-    T = df["T_C"].to_numpy()
-    HFc = df["HF_corr"].to_numpy()
+def compute_alpha_and_rate(df, meta, *, clamp_negative_hf=True, enforce_monotonic_alpha=True):
+    """
+    Fixes the 'loopty loop' by computing alpha in TIME-space (not temperature-space),
+    and then computing rate = dα/dt. This prevents α backtracking.
 
-    # Ensure reaction integrates positive (in T-space)
-    total_area = np.trapezoid(HFc, T)
-    if total_area < 0:
-        HFc = -HFc
-        df["HF_corr"] = HFc
+    Parameters
+    ----------
+    clamp_negative_hf : bool
+        If True, sets negative baseline-corrected heat flow to 0 before integrating.
+        This prevents unphysical "uncuring" from baseline/noise.
+    enforce_monotonic_alpha : bool
+        If True, forces α to be nondecreasing via cumulative max (removes tiny numerical backtracks).
+    """
 
-    cum = cumulative_trapz(T, HFc)
-    if cum[-1] == 0:
-        raise ValueError("Total corrected area is zero; baseline likely wrong.")
+    # --- require time ---
+    if "t_min" not in df.columns or df["t_min"].isna().any():
+        raise ValueError("Need a valid 't_min' column to compute α(t) and dα/dt reliably.")
 
-    alpha = cum / cum[-1]
-    df["alpha"] = np.clip(alpha, 0.0, 1.0)
+    # Work in time order (critical)
+    df = df.sort_values("t_min").reset_index(drop=True)
 
-    # rate dα/dt (prefer time column)
-    if "t_min" in df.columns and df["t_min"].notna().all():
-        t_s = df["t_min"].to_numpy() * 60.0
-        df["rate"] = np.gradient(df["alpha"].to_numpy(), t_s)
+    t_s = df["t_min"].to_numpy(dtype=float) * 60.0
+
+    if "HF_corr" not in df.columns:
+        raise ValueError("Expected 'HF_corr' column (baseline-subtracted heat flow).")
+
+    hf = df["HF_corr"].to_numpy(dtype=float)
+
+    # Optional: remove unphysical negative segments caused by imperfect baseline
+    if clamp_negative_hf:
+        hf_use = np.maximum(hf, 0.0)
     else:
-        beta = meta.get("heating_rate_C_min")
-        if beta is None:
-            raise ValueError("No time column and heating rate not found in metadata.")
-        beta_C_s = beta / 60.0
-        df["rate"] = np.gradient(df["alpha"].to_numpy(), T) * beta_C_s
+        hf_use = hf
+
+    # Cumulative integral in time: alpha(t) = ∫0^t HF dt / ∫0^T HF dt
+    cum = cumulative_trapz(t_s, hf_use)
+    total = cum[-1]
+
+    if not np.isfinite(total) or abs(total) < 1e-12:
+        raise ValueError(
+            "Total corrected heat flow integral is ~0. "
+            "Baseline windows likely wrong or HF_corr got wiped out."
+        )
+
+    alpha = cum / total
+
+    # Optional: enforce monotonic alpha (kills tiny numerical backtracks)
+    if enforce_monotonic_alpha:
+        alpha = np.maximum.accumulate(alpha)
+
+    df["alpha"] = alpha
+
+    # Rate dα/dt (1/s)
+    rate = np.gradient(alpha, t_s)
+
+    # Optional safety: set tiny negative rates to 0 (baseline noise)
+    if clamp_negative_hf:
+        rate = np.maximum(rate, 0.0)
+
+    df["rate"] = rate
 
     return df
 
