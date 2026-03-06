@@ -264,6 +264,9 @@ def compute_alpha_and_rate(df, meta, *, clamp_negative_hf=True, enforce_monotoni
 
     hf = df["HF_corr"].to_numpy(dtype=float)
 
+    # Remove negative heat flow (baseline noise)
+    hf = np.maximum(hf, 0.0)
+
     # Optional: remove unphysical negative segments caused by imperfect baseline
     if clamp_negative_hf:
         hf_use = np.maximum(hf, 0.0)
