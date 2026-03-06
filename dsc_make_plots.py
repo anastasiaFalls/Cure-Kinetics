@@ -267,6 +267,19 @@ def compute_alpha_and_rate(df, meta, *, clamp_negative_hf=True, enforce_monotoni
     # Remove negative heat flow (baseline noise)
     hf = np.maximum(hf, 0.0)
 
+    # --- remove tail where reaction is finished ---
+    peak = np.max(hf)
+    threshold = 0.03 * peak   # 3% of peak heat flow
+
+    mask = hf >= threshold
+
+    # keep only the main reaction region
+    first = np.argmax(mask)
+    last = len(mask) - np.argmax(mask[::-1])
+
+    df = df.iloc[first:last].reset_index(drop=True)
+    hf = hf[first:last]
+
     # Optional: remove unphysical negative segments caused by imperfect baseline
     if clamp_negative_hf:
         hf_use = np.maximum(hf, 0.0)
